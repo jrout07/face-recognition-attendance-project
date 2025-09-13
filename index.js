@@ -197,46 +197,75 @@ app.get("/create-collection", async (req, res) => {
   }
 });
 
-/* ------------------ Face Attendance ------------------ */
+/* ------------------ Face Attendance with Blink ------------------ */
 app.post("/markAttendanceLive", async (req, res) => {
   const { imageBase64, userId } = req.body;
   if (!imageBase64 || !userId)
     return res.status(400).json({ success: false, error: "Image and userId required" });
 
-  const imageBuffer = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), "base64");
+  const imageBuffer = Buffer.from(
+    imageBase64.replace(/^data:image\/\w+;base64,/, ""),
+    "base64"
+  );
 
   try {
-    const userResp = await dynamoDB.send(new GetCommand({ TableName: process.env.DYNAMODB_TABLE, Key: { userId } }));
-    if (!userResp.Item) return res.json({ success: false, message: "User not found", suspicious: true });
-    if (!userResp.Item.approved) return res.json({ success: false, message: "User not approved", suspicious: true });
+    const userResp = await dynamoDB.send(
+      new GetCommand({
+        TableName: process.env.DYNAMODB_TABLE,
+        Key: { userId },
+      })
+    );
+    if (!userResp.Item)
+      return res.json({ success: false, message: "User not found", suspicious: true });
+    if (!userResp.Item.approved)
+      return res.json({ success: false, message: "User not approved", suspicious: true });
 
-    // Detect face
-    const detectResponse = await rekognition.send(new DetectFacesCommand({ Image: { Bytes: imageBuffer }, Attributes: ["ALL"] }));
+    // 1️⃣ Detect face & check blink
+    const detectResponse = await rekognition.send(
+      new DetectFacesCommand({
+        Image: { Bytes: imageBuffer },
+        Attributes: ["ALL"],
+      })
+    );
+
     const faceCount = detectResponse.FaceDetails.length;
-    if (faceCount === 0) return res.json({ success: false, message: "No face detected", suspicious: true });
-    if (faceCount > 1) return res.json({ success: false, message: "Multiple faces detected", suspicious: true });
+    if (faceCount === 0)
+      return res.json({ success: false, message: "No face detected", suspicious: true });
+    if (faceCount > 1)
+      return res.json({ success: false, message: "Multiple faces detected", suspicious: true });
 
-    // Check face match
-    const searchResponse = await rekognition.send(new SearchFacesByImageCommand({
-      CollectionId: process.env.REKOGNITION_COLLECTION_ID,
-      Image: { Bytes: imageBuffer },
-      MaxFaces: 5,
-      FaceMatchThreshold: FACE_MATCH_THRESHOLD
-    }));
+    const eyesOpen = detectResponse.FaceDetails[0].EyesOpen?.Value;
+    if (eyesOpen !== false) {
+      // 👁 Require blink to continue
+      return res.json({ success: false, message: "Please blink to capture" });
+    }
 
-    const matchedFace = searchResponse.FaceMatches?.find(f => f.Face.ExternalImageId === userId);
-    if (!matchedFace) return res.json({ success: false, message: "Face does not match!", suspicious: true });
+    // 2️⃣ Search face in Rekognition collection
+    const searchResponse = await rekognition.send(
+      new SearchFacesByImageCommand({
+        CollectionId: process.env.REKOGNITION_COLLECTION_ID,
+        Image: { Bytes: imageBuffer },
+        MaxFaces: 5,
+        FaceMatchThreshold: FACE_MATCH_THRESHOLD,
+      })
+    );
+
+    const matchedFace = searchResponse.FaceMatches?.find(
+      (f) => f.Face.ExternalImageId === userId
+    );
+    if (!matchedFace)
+      return res.json({ success: false, message: "Face does not match!", suspicious: true });
 
     const similarity = matchedFace.Similarity;
     const suspicious = similarity < SUSPICIOUS_THRESHOLD;
 
-    // Teacher role: generate QR session
+    // 3️⃣ Teacher: create QR session
     if (userResp.Item.role === "teacher") {
       const sessionId = uuidv4();
       const qrToken = uuidv4();
       const now = new Date();
-      const validUntil = new Date(now.getTime() + 10 * 60 * 1000).toISOString(); // 10 minutes session
-      const qrExpiresAt = new Date(now.getTime() + 20 * 1000).toISOString(); // QR valid 10 sec
+      const validUntil = new Date(now.getTime() + 10 * 60 * 1000).toISOString(); // 10 minutes
+      const qrExpiresAt = new Date(now.getTime() + 20 * 1000).toISOString(); // 20 sec QR
 
       const session = {
         sessionId,
@@ -244,37 +273,69 @@ app.post("/markAttendanceLive", async (req, res) => {
         classId: "classId-placeholder",
         validUntil,
         qrToken,
-        qrExpiresAt
+        qrExpiresAt,
       };
 
-      await dynamoDB.send(new PutCommand({ TableName: process.env.DYNAMODB_SESSIONS_TABLE, Item: session }));
+      await dynamoDB.send(
+        new PutCommand({
+          TableName: process.env.DYNAMODB_SESSIONS_TABLE,
+          Item: session,
+        })
+      );
 
       return res.json({
         success: true,
-        message: "Teacher recognized, QR session created",
+        message: "Teacher recognized (blink verified), QR session created",
         similarity,
         suspicious,
-        session: { sessionId, qrToken, validUntil, qrExpiresAt }
+        session: { sessionId, qrToken, validUntil, qrExpiresAt },
       });
     }
 
-    // Student role: mark attendance
+    // 4️⃣ Student: mark attendance
     const today = new Date().toISOString().split("T")[0];
-    const existing = await dynamoDB.send(new GetCommand({ TableName: process.env.DYNAMODB_ATTENDANCE_TABLE, Key: { userId, date: today } }));
-    if (existing.Item) return res.json({ success: true, message: "Attendance already marked", similarity, suspicious: false });
+    const existing = await dynamoDB.send(
+      new GetCommand({
+        TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
+        Key: { userId, date: today },
+      })
+    );
+    if (existing.Item)
+      return res.json({
+        success: true,
+        message: "Attendance already marked",
+        similarity,
+        suspicious: false,
+      });
 
-    await dynamoDB.send(new PutCommand({
-      TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
-      Item: { userId, date: today, timestamp: new Date().toISOString(), status: suspicious ? "Present (Low Confidence)" : "Present", similarity, suspicious }
-    }));
+    await dynamoDB.send(
+      new PutCommand({
+        TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
+        Item: {
+          userId,
+          date: today,
+          timestamp: new Date().toISOString(),
+          status: suspicious ? "Present (Low Confidence)" : "Present",
+          similarity,
+          suspicious,
+        },
+      })
+    );
 
-    res.json({ success: true, message: "Attendance marked", similarity, suspicious });
-
+    res.json({
+      success: true,
+      message: "Attendance marked (blink verified)",
+      similarity,
+      suspicious,
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: err.message, suspicious: true });
+    console.error("markAttendanceLive error:", err);
+    res
+      .status(500)
+      .json({ success: false, error: err.message, suspicious: true });
   }
 });
+
 
 /* ------------------ Teacher Session & QR ------------------ */
 app.post("/teacher/createSession", async (req, res) => {
@@ -396,8 +457,6 @@ app.post("/attendance/mark", async (req, res) => {
     console.error("QR Attendance error:", err);
     res.status(500).json({ success: false, error: err.message });
   }
-});
-
 });
 
 /* ------------------ Teacher Submit Attendance ------------------ */
