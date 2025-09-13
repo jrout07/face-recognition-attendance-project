@@ -209,18 +209,13 @@ app.post("/markAttendanceLive", async (req, res) => {
   );
 
   try {
-    const userResp = await dynamoDB.send(
-      new GetCommand({
-        TableName: process.env.DYNAMODB_TABLE,
-        Key: { userId },
-      })
-    );
+    const userResp = await dynamoDB.send(new GetCommand({ TableName: process.env.DYNAMODB_TABLE, Key: { userId } }));
     if (!userResp.Item)
       return res.json({ success: false, message: "User not found", suspicious: true });
     if (!userResp.Item.approved)
       return res.json({ success: false, message: "User not approved", suspicious: true });
 
-    // 1️⃣ Detect face & check blink
+    // 🔍 Detect face & check blink
     const detectResponse = await rekognition.send(
       new DetectFacesCommand({
         Image: { Bytes: imageBuffer },
@@ -236,11 +231,11 @@ app.post("/markAttendanceLive", async (req, res) => {
 
     const eyesOpen = detectResponse.FaceDetails[0].EyesOpen?.Value;
     if (eyesOpen !== false) {
-      // 👁 Require blink to continue
-      return res.json({ success: false, message: "Please blink to capture" });
+      // 👁 Require student to blink
+      return res.json({ success: false, message: "Please blink to capture your attendance" });
     }
 
-    // 2️⃣ Search face in Rekognition collection
+    // ✅ Search face in collection
     const searchResponse = await rekognition.send(
       new SearchFacesByImageCommand({
         CollectionId: process.env.REKOGNITION_COLLECTION_ID,
@@ -250,16 +245,14 @@ app.post("/markAttendanceLive", async (req, res) => {
       })
     );
 
-    const matchedFace = searchResponse.FaceMatches?.find(
-      (f) => f.Face.ExternalImageId === userId
-    );
+    const matchedFace = searchResponse.FaceMatches?.find((f) => f.Face.ExternalImageId === userId);
     if (!matchedFace)
       return res.json({ success: false, message: "Face does not match!", suspicious: true });
 
     const similarity = matchedFace.Similarity;
     const suspicious = similarity < SUSPICIOUS_THRESHOLD;
 
-    // 3️⃣ Teacher: create QR session
+    // 👩‍🏫 Teacher: create QR session
     if (userResp.Item.role === "teacher") {
       const sessionId = uuidv4();
       const qrToken = uuidv4();
@@ -267,21 +260,12 @@ app.post("/markAttendanceLive", async (req, res) => {
       const validUntil = new Date(now.getTime() + 10 * 60 * 1000).toISOString(); // 10 minutes
       const qrExpiresAt = new Date(now.getTime() + 20 * 1000).toISOString(); // 20 sec QR
 
-      const session = {
-        sessionId,
-        teacherId: userId,
-        classId: "classId-placeholder",
-        validUntil,
-        qrToken,
-        qrExpiresAt,
-      };
+      const session = { sessionId, teacherId: userId, classId: "classId-placeholder", validUntil, qrToken, qrExpiresAt };
 
-      await dynamoDB.send(
-        new PutCommand({
-          TableName: process.env.DYNAMODB_SESSIONS_TABLE,
-          Item: session,
-        })
-      );
+      await dynamoDB.send(new PutCommand({
+        TableName: process.env.DYNAMODB_SESSIONS_TABLE,
+        Item: session,
+      }));
 
       return res.json({
         success: true,
@@ -292,50 +276,26 @@ app.post("/markAttendanceLive", async (req, res) => {
       });
     }
 
-    // 4️⃣ Student: mark attendance
+    // 👨‍🎓 Student: mark attendance
     const today = new Date().toISOString().split("T")[0];
-    const existing = await dynamoDB.send(
-      new GetCommand({
-        TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
-        Key: { userId, date: today },
-      })
-    );
+    const existing = await dynamoDB.send(new GetCommand({
+      TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
+      Key: { userId, date: today },
+    }));
     if (existing.Item)
-      return res.json({
-        success: true,
-        message: "Attendance already marked",
-        similarity,
-        suspicious: false,
-      });
+      return res.json({ success: true, message: "Attendance already marked", similarity, suspicious: false });
 
-    await dynamoDB.send(
-      new PutCommand({
-        TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
-        Item: {
-          userId,
-          date: today,
-          timestamp: new Date().toISOString(),
-          status: suspicious ? "Present (Low Confidence)" : "Present",
-          similarity,
-          suspicious,
-        },
-      })
-    );
+    await dynamoDB.send(new PutCommand({
+      TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
+      Item: { userId, date: today, timestamp: new Date().toISOString(), status: suspicious ? "Present (Low Confidence)" : "Present", similarity, suspicious },
+    }));
 
-    res.json({
-      success: true,
-      message: "Attendance marked (blink verified)",
-      similarity,
-      suspicious,
-    });
+    res.json({ success: true, message: "Attendance marked (blink verified)", similarity, suspicious });
   } catch (err) {
     console.error("markAttendanceLive error:", err);
-    res
-      .status(500)
-      .json({ success: false, error: err.message, suspicious: true });
+    res.status(500).json({ success: false, error: err.message, suspicious: true });
   }
 });
-
 
 /* ------------------ Teacher Session & QR ------------------ */
 app.post("/teacher/createSession", async (req, res) => {
@@ -393,14 +353,7 @@ app.get("/teacher/getSession/:classId", async (req, res) => {
 
     res.json({
       success: true,
-      session: {
-        sessionId: session.sessionId,
-        classId: session.classId,
-        teacherId: session.teacherId,
-        validUntil: session.validUntil,
-        qrToken: session.qrToken,
-        qrExpiresAt: session.qrExpiresAt
-      }
+      session: { sessionId: session.sessionId, classId: session.classId, teacherId: session.teacherId, validUntil: session.validUntil, qrToken: session.qrToken, qrExpiresAt: session.qrExpiresAt }
     });
   } catch (err) {
     console.error("Get session error:", err);
@@ -415,17 +368,11 @@ app.post("/attendance/mark", async (req, res) => {
     return res.status(400).json({ success: false, error: "userId, sessionId & qrToken required" });
 
   try {
-    const userResp = await dynamoDB.send(new GetCommand({
-      TableName: process.env.DYNAMODB_TABLE,
-      Key: { userId }
-    }));
+    const userResp = await dynamoDB.send(new GetCommand({ TableName: process.env.DYNAMODB_TABLE, Key: { userId } }));
     if (!userResp.Item) return res.status(404).json({ success: false, error: "User not found" });
     if (!userResp.Item.approved) return res.status(403).json({ success: false, error: "User not approved" });
 
-    const sessionResp = await dynamoDB.send(new GetCommand({
-      TableName: process.env.DYNAMODB_SESSIONS_TABLE,
-      Key: { sessionId }
-    }));
+    const sessionResp = await dynamoDB.send(new GetCommand({ TableName: process.env.DYNAMODB_SESSIONS_TABLE, Key: { sessionId } }));
     if (!sessionResp.Item) return res.status(404).json({ success: false, error: "Session not found" });
 
     const now = new Date();
@@ -434,22 +381,14 @@ app.post("/attendance/mark", async (req, res) => {
     if (sessionResp.Item.qrToken !== qrToken || new Date(sessionResp.Item.qrExpiresAt) < now)
       return res.status(400).json({ success: false, error: "Invalid or expired QR" });
 
-    // ✅ Check duplicates by sessionId
-    const existing = await dynamoDB.send(new GetCommand({
-      TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
-      Key: { userId, sessionId }   // 👈 composite key
-    }));
+    // ✅ Prevent duplicate attendance in same session
+    const existing = await dynamoDB.send(new GetCommand({ TableName: process.env.DYNAMODB_ATTENDANCE_TABLE, Key: { userId, sessionId } }));
     if (existing.Item)
       return res.json({ success: true, message: "Attendance already marked for this session" });
 
     await dynamoDB.send(new PutCommand({
       TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
-      Item: {
-        userId,
-        sessionId,
-        timestamp: now.toISOString(),
-        status: "Present"
-      }
+      Item: { userId, sessionId, timestamp: now.toISOString(), status: "Present" }
     }));
 
     res.json({ success: true, message: "Attendance marked via QR" });
