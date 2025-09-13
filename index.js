@@ -236,7 +236,7 @@ app.post("/markAttendanceLive", async (req, res) => {
       const qrToken = uuidv4();
       const now = new Date();
       const validUntil = new Date(now.getTime() + 10 * 60 * 1000).toISOString(); // 10 minutes session
-      const qrExpiresAt = new Date(now.getTime() + 10 * 1000).toISOString(); // QR valid 10 sec
+      const qrExpiresAt = new Date(now.getTime() + 20 * 1000).toISOString(); // QR valid 10 sec
 
       const session = {
         sessionId,
@@ -287,7 +287,7 @@ app.post("/teacher/createSession", async (req, res) => {
     const validUntil = new Date(now.getTime() + (durationMinutes || 10) * 60 * 1000).toISOString();
     const sessionId = uuidv4();
     const qrToken = uuidv4();
-    const qrExpiresAt = new Date(now.getTime() + 10 * 1000).toISOString();
+    const qrExpiresAt = new Date(now.getTime() + 20 * 1000).toISOString();
 
     const session = { sessionId, teacherId, classId, validUntil, qrToken, qrExpiresAt };
 
@@ -322,7 +322,7 @@ app.get("/teacher/getSession/:classId", async (req, res) => {
 
     if (!session.qrExpiresAt || new Date(session.qrExpiresAt) <= now) {
       session.qrToken = uuidv4();
-      session.qrExpiresAt = new Date(now.getTime() + 10 * 1000).toISOString();
+      session.qrExpiresAt = new Date(now.getTime() + 20 * 1000).toISOString();
 
       await dynamoDB.send(new PutCommand({
         TableName: process.env.DYNAMODB_SESSIONS_TABLE,
