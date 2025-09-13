@@ -354,25 +354,41 @@ app.post("/attendance/mark", async (req, res) => {
     return res.status(400).json({ success: false, error: "userId, sessionId & qrToken required" });
 
   try {
-    const userResp = await dynamoDB.send(new GetCommand({ TableName: process.env.DYNAMODB_TABLE, Key: { userId } }));
+    const userResp = await dynamoDB.send(new GetCommand({
+      TableName: process.env.DYNAMODB_TABLE,
+      Key: { userId }
+    }));
     if (!userResp.Item) return res.status(404).json({ success: false, error: "User not found" });
     if (!userResp.Item.approved) return res.status(403).json({ success: false, error: "User not approved" });
 
-    const sessionResp = await dynamoDB.send(new GetCommand({ TableName: process.env.DYNAMODB_SESSIONS_TABLE, Key: { sessionId } }));
+    const sessionResp = await dynamoDB.send(new GetCommand({
+      TableName: process.env.DYNAMODB_SESSIONS_TABLE,
+      Key: { sessionId }
+    }));
     if (!sessionResp.Item) return res.status(404).json({ success: false, error: "Session not found" });
 
     const now = new Date();
-    if (new Date(sessionResp.Item.validUntil) < now) return res.status(400).json({ success: false, error: "Session expired" });
+    if (new Date(sessionResp.Item.validUntil) < now)
+      return res.status(400).json({ success: false, error: "Session expired" });
     if (sessionResp.Item.qrToken !== qrToken || new Date(sessionResp.Item.qrExpiresAt) < now)
       return res.status(400).json({ success: false, error: "Invalid or expired QR" });
 
-    const today = new Date().toISOString().split("T")[0];
-    const existing = await dynamoDB.send(new GetCommand({ TableName: process.env.DYNAMODB_ATTENDANCE_TABLE, Key: { userId, date: today } }));
-    if (existing.Item) return res.json({ success: true, message: "Attendance already marked" });
+    // ✅ Check duplicates by sessionId
+    const existing = await dynamoDB.send(new GetCommand({
+      TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
+      Key: { userId, sessionId }   // 👈 composite key
+    }));
+    if (existing.Item)
+      return res.json({ success: true, message: "Attendance already marked for this session" });
 
     await dynamoDB.send(new PutCommand({
       TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
-      Item: { userId, date: today, sessionId, timestamp: now.toISOString(), status: "Present" }
+      Item: {
+        userId,
+        sessionId,
+        timestamp: now.toISOString(),
+        status: "Present"
+      }
     }));
 
     res.json({ success: true, message: "Attendance marked via QR" });
@@ -380,6 +396,8 @@ app.post("/attendance/mark", async (req, res) => {
     console.error("QR Attendance error:", err);
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
 });
 
 /* ------------------ Teacher Submit Attendance ------------------ */
