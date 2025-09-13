@@ -46,7 +46,7 @@ const rekognition = new RekognitionClient({
   },
 });
 
-/* ------------------ Helper: Ensure all users have approved field ------------------ */
+/* ------------------ Helper: Ensure all users have 'approved' field ------------------ */
 async function ensureApprovedField() {
   try {
     const data = await dynamoDB.send(new ScanCommand({ TableName: process.env.DYNAMODB_TABLE }));
@@ -382,7 +382,33 @@ app.post("/attendance/mark", async (req, res) => {
   }
 });
 
-/* ------------------ Server ------------------ */
+/* ------------------ Teacher Submit Attendance ------------------ */
+app.post("/teacher/submitAttendance", async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) return res.status(400).json({ success: false, error: "sessionId required" });
+
+  try {
+    const sessionResp = await dynamoDB.send(new GetCommand({
+      TableName: process.env.DYNAMODB_SESSIONS_TABLE,
+      Key: { sessionId }
+    }));
+    if (!sessionResp.Item) return res.status(404).json({ success: false, error: "Session not found" });
+
+    await dynamoDB.send(new UpdateCommand({
+      TableName: process.env.DYNAMODB_SESSIONS_TABLE,
+      Key: { sessionId },
+      UpdateExpression: "SET finalized = :f",
+      ExpressionAttributeValues: { ":f": true }
+    }));
+
+    res.json({ success: true, message: "Attendance finalized!" });
+  } catch (err) {
+    console.error("Submit attendance error:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* ------------------ Start Server ------------------ */
 ensureApprovedField().then(() => {
   const PORT = process.env.PORT || 5002;
   app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`))
