@@ -76,7 +76,7 @@ async function ensureApprovedField() {
 
 /* ------------------ Root ------------------ */
 app.get("/", (req, res) =>
-  res.send("✅ Face Recognition Backend Running (Smile Enabled)")
+  res.send("✅ Face Recognition Backend Running (Smile Removed, Liveness Enabled)")
 );
 
 /* ------------------ Register User ------------------ */
@@ -226,8 +226,8 @@ app.post("/login", async (req, res) => {
   }
 });
 
-/* ------------------ Smile Detection ------------------ */
-app.post("/checkSmile", async (req, res) => {
+/* ------------------ Liveness Check (Basic Human Detection) ------------------ */
+app.post("/checkLiveness", async (req, res) => {
   const { imageBase64 } = req.body;
   if (!imageBase64)
     return res.status(400).json({ success: false, message: "Image required" });
@@ -248,21 +248,19 @@ app.post("/checkSmile", async (req, res) => {
     const faceDetails = detectResponse.FaceDetails || [];
     if (faceDetails.length === 0)
       return res.json({ success: false, message: "No face detected" });
+    if (faceDetails.length > 1)
+      return res.json({ success: false, message: "Multiple faces detected" });
 
-    const face = faceDetails[0];
-    const smile = face.Smile?.Value || false;
-    const confidence = face.Smile?.Confidence || 0;
-
-    return res.json({ success: true, smile, confidence });
+    return res.json({ success: true, message: "Human face detected" });
   } catch (err) {
-    console.error("checkSmile error:", err);
+    console.error("checkLiveness error:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
 
-/* ------------------ Face Attendance with Smile ------------------ */
+/* ------------------ Face Attendance ------------------ */
 app.post("/markAttendanceLive", async (req, res) => {
-  const { imageBase64, userId, smileVerified = false, sessionId } = req.body;
+  const { imageBase64, userId, sessionId } = req.body;
   if (!imageBase64 || !userId)
     return res
       .status(400)
@@ -301,12 +299,7 @@ app.post("/markAttendanceLive", async (req, res) => {
         .status(400)
         .json({ success: false, message: "Multiple faces detected" });
 
-    if (!smileVerified) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Smile verification required" });
-    }
-
+    // Match face
     const searchResponse = await rekognition.send(
       new SearchFacesByImageCommand({
         CollectionId: process.env.REKOGNITION_COLLECTION_ID,
@@ -355,7 +348,7 @@ app.post("/markAttendanceLive", async (req, res) => {
 
       return res.json({
         success: true,
-        message: "Teacher recognized (smile verified), QR session created",
+        message: "Teacher recognized, QR session created",
         similarity,
         suspicious,
         session,
@@ -414,7 +407,7 @@ app.post("/markAttendanceLive", async (req, res) => {
 
     return res.json({
       success: true,
-      message: "Attendance marked (smile verified)",
+      message: "Attendance marked",
       similarity,
       suspicious,
     });
