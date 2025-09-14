@@ -25,7 +25,6 @@ app.use(express.json());
 
 /* ------------------ Thresholds ------------------ */
 const FACE_MATCH_THRESHOLD = Number(process.env.FACE_MATCH_THRESHOLD) || 50;
-const SUSPICIOUS_THRESHOLD = Number(process.env.SUSPICIOUS_THRESHOLD) || 80;
 
 /* ------------------ DynamoDB Config ------------------ */
 const ddbClient = new DynamoDBClient({
@@ -73,10 +72,10 @@ async function ensureApprovedField() {
 
 /* ------------------ Root ------------------ */
 app.get("/", (req, res) =>
-  res.send("✅ Face Recognition Backend Running (Smile Removed, Liveness Enabled)")
+  res.send("✅ Face Recognition Backend Running with Finalized Attendance Support")
 );
 
-/* ------------------ Register User ------------------ */
+/* ------------------ User Registration ------------------ */
 app.post("/registerUserLive", async (req, res) => {
   const { userId, name, email, password, role, imageBase64 } = req.body;
   if (!userId || !name || !password || !imageBase64)
@@ -101,9 +100,8 @@ app.post("/registerUserLive", async (req, res) => {
     const detectResponse = await rekognition.send(
       new DetectFacesCommand({ Image: { Bytes: imageBuffer }, Attributes: ["DEFAULT"] })
     );
-    const faceCount = (detectResponse.FaceDetails || []).length;
-    if (faceCount === 0) return res.status(400).json({ success: false, error: "No face detected." });
-    if (faceCount > 1) return res.status(400).json({ success: false, error: "More than one face detected." });
+    if ((detectResponse.FaceDetails || []).length !== 1)
+      return res.status(400).json({ success: false, error: "Image must contain exactly 1 face" });
 
     // Check duplicate face
     const searchResponse = await rekognition.send(
@@ -128,11 +126,12 @@ app.post("/registerUserLive", async (req, res) => {
           password,
           role: role || "student",
           approved: false,
-          faceId: "dummy-face-id",
+          faceId: "pending",
         },
       })
     );
 
+    // Index face
     const indexResponse = await rekognition.send(
       new IndexFacesCommand({
         CollectionId: process.env.REKOGNITION_COLLECTION_ID,
@@ -143,7 +142,7 @@ app.post("/registerUserLive", async (req, res) => {
     );
 
     const faceId = indexResponse.FaceRecords?.[0]?.Face?.FaceId;
-    if (!faceId) return res.status(500).json({ success: false, error: "No face detected during indexing" });
+    if (!faceId) return res.status(500).json({ success: false, error: "Failed to index face" });
 
     await dynamoDB.send(
       new UpdateCommand({
@@ -180,93 +179,23 @@ app.post("/login", async (req, res) => {
     if (user.Item.password !== password) return res.status(401).json({ success: false, error: "Incorrect password" });
     if (!user.Item.approved) return res.status(403).json({ success: false, error: "Pending approval by admin" });
 
-    res.json({
-      success: true,
-      message: "Login successful",
-      userId,
-      role: user.Item.role,
-    });
+    res.json({ success: true, message: "Login successful", userId, role: user.Item.role });
   } catch (err) {
     console.error("login error:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-/* ------------------ Liveness Check ------------------ */
-app.post("/checkLiveness", async (req, res) => {
-  const { imageBase64 } = req.body;
-  if (!imageBase64) return res.status(400).json({ success: false, message: "Image required" });
-
-  try {
-    const imageBuffer = Buffer.from(
-      imageBase64.replace(/^data:image\/\w+;base64,/, ""),
-      "base64"
-    );
-
-    const detectResponse = await rekognition.send(
-      new DetectFacesCommand({ Image: { Bytes: imageBuffer }, Attributes: ["ALL"] })
-    );
-
-    const faceDetails = detectResponse.FaceDetails || [];
-    if (faceDetails.length === 0) return res.json({ success: false, message: "No face detected" });
-    if (faceDetails.length > 1) return res.json({ success: false, message: "Multiple faces detected" });
-
-    return res.json({ success: true, message: "Human face detected" });
-  } catch (err) {
-    console.error("checkLiveness error:", err);
-    return res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-/* ------------------ Face Verification Only ------------------ */
-app.post("/verifyFaceOnly", async (req, res) => {
-  const { userId, imageBase64 } = req.body;
-  if (!userId || !imageBase64) {
-    return res.status(400).json({ success: false, error: "userId and imageBase64 required" });
-  }
-
-  try {
-    const imageBuffer = Buffer.from(
-      imageBase64.replace(/^data:image\/\w+;base64,/, ""),
-      "base64"
-    );
-
-    const searchResponse = await rekognition.send(
-      new SearchFacesByImageCommand({
-        CollectionId: process.env.REKOGNITION_COLLECTION_ID,
-        Image: { Bytes: imageBuffer },
-        MaxFaces: 1,
-        FaceMatchThreshold: FACE_MATCH_THRESHOLD,
-      })
-    );
-
-    const faceMatch = searchResponse.FaceMatches?.[0];
-    if (!faceMatch) return res.json({ success: false, error: "No matching face found" });
-
-    if (faceMatch.Face?.ExternalImageId !== userId) {
-      return res.json({ success: false, error: "Face does not match user ID" });
-    }
-
-    return res.json({ success: true, message: "Face verified" });
-  } catch (err) {
-    console.error("verifyFaceOnly error:", err);
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-/* ------------------ Face Verification + Temp Attendance ------------------ */
+/* ------------------ Mark Attendance (temporary, requires finalization) ------------------ */
 app.post("/markAttendanceLive", async (req, res) => {
   const { sessionId, userId, imageBase64 } = req.body;
-  if (!sessionId || !userId || !imageBase64) {
+  if (!sessionId || !userId || !imageBase64)
     return res.status(400).json({ success: false, error: "sessionId, userId and imageBase64 required" });
-  }
 
   try {
-    const imageBuffer = Buffer.from(
-      imageBase64.replace(/^data:image\/\w+;base64,/, ""),
-      "base64"
-    );
+    const imageBuffer = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), "base64");
 
+    // Face verification
     const searchResponse = await rekognition.send(
       new SearchFacesByImageCommand({
         CollectionId: process.env.REKOGNITION_COLLECTION_ID,
@@ -277,15 +206,10 @@ app.post("/markAttendanceLive", async (req, res) => {
     );
 
     const faceMatch = searchResponse.FaceMatches?.[0];
-    if (!faceMatch) {
-      return res.json({ success: false, error: "No matching face found" });
-    }
-
-    const matchedUserId = faceMatch.Face?.ExternalImageId;
-    if (matchedUserId !== userId) {
+    if (!faceMatch || faceMatch.Face?.ExternalImageId !== userId)
       return res.json({ success: false, error: "Face does not match user ID" });
-    }
 
+    // Save temporary attendance
     const attendance = {
       sessionId,
       userId,
@@ -294,21 +218,16 @@ app.post("/markAttendanceLive", async (req, res) => {
       timestamp: new Date().toISOString(),
     };
 
-    await dynamoDB.send(
-      new PutCommand({
-        TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
-        Item: attendance,
-      })
-    );
+    await dynamoDB.send(new PutCommand({ TableName: process.env.DYNAMODB_ATTENDANCE_TABLE, Item: attendance }));
 
-    return res.json({ success: true, message: "Face verified & attendance marked (pending finalization)" });
+    res.json({ success: true, message: "Attendance marked (pending teacher finalization)" });
   } catch (err) {
     console.error("markAttendanceLive error:", err);
-    return res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-/* ------------------ Teacher Session & QR ------------------ */
+/* ------------------ Teacher Creates Session ------------------ */
 app.post("/teacher/createSession", async (req, res) => {
   const { teacherId, classId, durationMinutes } = req.body;
   if (!teacherId || !classId)
@@ -328,73 +247,6 @@ app.post("/teacher/createSession", async (req, res) => {
     res.json({ success: true, session });
   } catch (err) {
     console.error("teacher/createSession error:", err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-/* ------------------ Teacher Get Session (with auto QR refresh) ------------------ */
-app.get("/teacher/getSession/:classId", async (req, res) => {
-  const { classId } = req.params;
-  try {
-    const sessionResp = await dynamoDB.send(
-      new QueryCommand({
-        TableName: process.env.DYNAMODB_SESSIONS_TABLE,
-        IndexName: "classId-index",
-        KeyConditionExpression: "classId = :c",
-        ExpressionAttributeValues: { ":c": classId },
-        Limit: 1,
-        ScanIndexForward: false,
-      })
-    );
-
-    if (!sessionResp.Items || sessionResp.Items.length === 0) {
-      return res.json({ success: false, error: "No active session" });
-    }
-
-    const session = sessionResp.Items[0];
-    const now = new Date();
-
-    if (!session.qrExpiresAt || new Date(session.qrExpiresAt) <= now) {
-      session.qrToken = uuidv4();
-      session.qrExpiresAt = new Date(now.getTime() + 20 * 1000).toISOString();
-
-      await dynamoDB.send(new PutCommand({ TableName: process.env.DYNAMODB_SESSIONS_TABLE, Item: session }));
-    }
-
-    res.json({
-      success: true,
-      session: {
-        sessionId: session.sessionId,
-        classId: session.classId,
-        teacherId: session.teacherId,
-        validUntil: session.validUntil,
-        qrToken: session.qrToken,
-        qrExpiresAt: session.qrExpiresAt,
-        finalized: session.finalized || false,
-      },
-    });
-  } catch (err) {
-    console.error("teacher/getSession error:", err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-/* ------------------ Teacher View Attendance ------------------ */
-app.get("/teacher/viewAttendance/:sessionId", async (req, res) => {
-  const { sessionId } = req.params;
-  try {
-    const attendanceResp = await dynamoDB.send(
-      new QueryCommand({
-        TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
-        IndexName: "sessionId-index",
-        KeyConditionExpression: "sessionId = :s",
-        ExpressionAttributeValues: { ":s": sessionId },
-      })
-    );
-
-    res.json({ success: true, attendance: attendanceResp.Items || [] });
-  } catch (err) {
-    console.error("viewAttendance error:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -425,6 +277,7 @@ app.post("/teacher/finalizeAttendance", async (req, res) => {
       })
     );
 
+    // Mark all as finalized
     const updates = attendanceResp.Items?.map((item) =>
       dynamoDB.send(
         new UpdateCommand({
@@ -448,11 +301,5 @@ app.post("/teacher/finalizeAttendance", async (req, res) => {
 /* ------------------ Start Server ------------------ */
 ensureApprovedField().then(() => {
   const PORT = process.env.PORT || 5002;
-  app
-    .listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`))
-    .on("error", (err) => {
-      if (err.code === "EADDRINUSE") {
-        console.error(`Port ${PORT} already in use. Kill existing process or change PORT.`);
-      } else console.error(err);
-    });
+  app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 });
