@@ -24,15 +24,25 @@ app.use(cors());
 app.use(express.json());
 
 /* ------------------ Config / Thresholds ------------------ */
-const FACE_MATCH_THRESHOLD = Number(process.env.FACE_MATCH_THRESHOLD) || 50;
+// Face match threshold (higher is stricter). Can be overridden via env.
+const FACE_MATCH_THRESHOLD = Number(process.env.FACE_MATCH_THRESHOLD) || 80;
+// How long a QR token is valid (seconds). Default 60s.
+const QR_EXPIRE_SECONDS = Number(process.env.QR_EXPIRE_SECONDS) || 60;
+
 const USERS_TABLE = process.env.DYNAMODB_TABLE;
 const ATT_TABLE = process.env.DYNAMODB_ATTENDANCE_TABLE;
 const SESSIONS_TABLE = process.env.DYNAMODB_SESSIONS_TABLE;
 const REK_COLLECTION = process.env.REKOGNITION_COLLECTION_ID;
 
+if (!USERS_TABLE || !ATT_TABLE || !SESSIONS_TABLE || !REK_COLLECTION) {
+  console.warn(
+    "Warning: One or more required environment variables missing: DYNAMODB_TABLE, DYNAMODB_ATTENDANCE_TABLE, DYNAMODB_SESSIONS_TABLE, REKOGNITION_COLLECTION_ID"
+  );
+}
+
 /* ------------------ DynamoDB Client ------------------ */
 const ddbClient = new DynamoDBClient({
-  region: process.env.DYNAMODB_REGION || process.env.AWS_REGION,
+  region: process.env.DYNAMODB_REGION || process.env.AWS_REGION || "us-east-1",
   credentials:
     process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
       ? {
@@ -45,7 +55,7 @@ const dynamoDB = DynamoDBDocumentClient.from(ddbClient);
 
 /* ------------------ Rekognition Client ------------------ */
 const rekognition = new RekognitionClient({
-  region: process.env.REKOGNITION_REGION || process.env.AWS_REGION,
+  region: process.env.REKOGNITION_REGION || process.env.AWS_REGION || "us-east-1",
   credentials:
     process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
       ? {
@@ -58,7 +68,10 @@ const rekognition = new RekognitionClient({
 /* ------------------ Helper: Ensure approved field exists for users ------------------ */
 async function ensureApprovedField() {
   try {
-    if (!USERS_TABLE) return;
+    if (!USERS_TABLE) {
+      console.debug("USERS_TABLE not set - skipping ensureApprovedField");
+      return;
+    }
     const data = await dynamoDB.send(new ScanCommand({ TableName: USERS_TABLE }));
     for (const item of data.Items || []) {
       if (item.approved === undefined) {
@@ -72,14 +85,16 @@ async function ensureApprovedField() {
         );
       }
     }
-    console.log("✅ All missing 'approved' fields updated!");
+    console.log("✅ All missing 'approved' fields updated (if any).");
   } catch (err) {
     console.error("ensureApprovedField error:", err);
   }
 }
 
 /* ------------------ Root ------------------ */
-app.get("/", (req, res) => res.send("✅ Face Recognition Backend Running (finalized attendance support)"));
+app.get("/", (req, res) =>
+  res.send("✅ Face Recognition Backend Running (finalized attendance support)")
+);
 
 /* ------------------ Helper: fetch session by sessionId ------------------ */
 async function getSessionById(sessionId) {
@@ -95,9 +110,9 @@ async function getSessionById(sessionId) {
 
 /* ------------------ Helper: find active session by classId (prefers GSI) ------------------ */
 async function findActiveSessionByClass(classId) {
+  if (!classId) return null;
   // try Query using GSI 'classId-index' if exists
   try {
-    // Query (works when GSI exists with partition = classId)
     const q = {
       TableName: SESSIONS_TABLE,
       IndexName: "classId-index",
@@ -131,11 +146,11 @@ async function findActiveSessionByClass(classId) {
 /* ------------------ Face verification endpoint (used by frontends) ------------------ */
 app.post("/verifyFaceOnly", async (req, res) => {
   const { userId, imageBase64 } = req.body;
-  if (!userId || !imageBase64) return res.status(400).json({ success: false, error: "userId and imageBase64 required" });
+  if (!userId || !imageBase64)
+    return res.status(400).json({ success: false, error: "userId and imageBase64 required" });
 
   try {
     const imageBuffer = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), "base64");
-
     const searchResponse = await rekognition.send(
       new SearchFacesByImageCommand({
         CollectionId: REK_COLLECTION,
@@ -169,8 +184,10 @@ app.post("/registerUserLive", async (req, res) => {
 
     const imageBuffer = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), "base64");
 
+    // Ensure exactly 1 face
     const detectResponse = await rekognition.send(new DetectFacesCommand({ Image: { Bytes: imageBuffer }, Attributes: ["DEFAULT"] }));
-    if ((detectResponse.FaceDetails || []).length !== 1) return res.status(400).json({ success: false, error: "Image must contain exactly 1 face" });
+    if ((detectResponse.FaceDetails || []).length !== 1)
+      return res.status(400).json({ success: false, error: "Image must contain exactly 1 face" });
 
     // Check duplicates
     const searchResponse = await rekognition.send(
@@ -181,9 +198,10 @@ app.post("/registerUserLive", async (req, res) => {
         FaceMatchThreshold: FACE_MATCH_THRESHOLD,
       })
     );
-    if (searchResponse.FaceMatches?.length > 0) return res.status(400).json({ success: false, error: "Face already registered" });
+    if (searchResponse.FaceMatches?.length > 0)
+      return res.status(400).json({ success: false, error: "Face already registered" });
 
-    // Create user (pending)
+    // Create user (pending approval)
     await dynamoDB.send(
       new PutCommand({
         TableName: USERS_TABLE,
@@ -231,7 +249,8 @@ app.post("/registerUserLive", async (req, res) => {
 /* ------------------ Login ------------------ */
 app.post("/login", async (req, res) => {
   const { userId, password } = req.body;
-  if (!userId || !password) return res.status(400).json({ success: false, error: "userId and password required" });
+  if (!userId || !password)
+    return res.status(400).json({ success: false, error: "userId and password required" });
 
   try {
     const user = await dynamoDB.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId } }));
@@ -283,17 +302,14 @@ app.post("/markAttendanceLive", async (req, res) => {
       return res.status(400).json({ success: false, error: "Face does not match user ID" });
 
     // Prevent duplicate: check if attendance exists
-    // We expect Attendance table to have partitionKey=sessionId, sortKey=userId
     try {
       const existing = await dynamoDB.send(
         new GetCommand({ TableName: ATT_TABLE, Key: { sessionId, userId } })
       );
       if (existing.Item) {
-        // If already finalized, don't allow changes
         if (existing.Item.finalized) {
           return res.status(400).json({ success: false, error: "Attendance already finalized" });
         }
-        // If exists but not finalized, return success (idempotent)
         return res.json({ success: true, message: "Attendance already marked (pending finalization)" });
       }
     } catch (err) {
@@ -321,20 +337,30 @@ app.post("/markAttendanceLive", async (req, res) => {
 /* ------------------ Teacher Creates Session ------------------ */
 app.post("/teacher/createSession", async (req, res) => {
   const { teacherId, classId, durationMinutes } = req.body;
-  if (!teacherId || !classId) return res.status(400).json({ success: false, error: "teacherId & classId required" });
+  if (!teacherId || !classId)
+    return res.status(400).json({ success: false, error: "teacherId & classId required" });
 
   try {
+    // validate teacher exists and is approved teacher
+    const teacher = await dynamoDB.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: teacherId } }));
+    if (!teacher.Item) return res.status(403).json({ success: false, error: "Teacher not found" });
+    if (teacher.Item.role !== "teacher") return res.status(403).json({ success: false, error: "User not a teacher" });
+    if (!teacher.Item.approved) return res.status(403).json({ success: false, error: "Teacher not approved" });
+
     const now = new Date();
     const validUntil = new Date(now.getTime() + (durationMinutes || 10) * 60 * 1000).toISOString();
     const sessionId = uuidv4();
     const qrToken = uuidv4();
-    const qrExpiresAt = new Date(now.getTime() + 20 * 1000).toISOString();
+    const qrExpiresAt = new Date(now.getTime() + QR_EXPIRE_SECONDS * 1000).toISOString();
 
     const session = { sessionId, teacherId, classId, validUntil, qrToken, qrExpiresAt, finalized: false };
 
     await dynamoDB.send(new PutCommand({ TableName: SESSIONS_TABLE, Item: session }));
 
-    return res.json({ success: true, session });
+    // Build qrPayload string teacher frontend should encode as the QR
+    const qrPayload = JSON.stringify({ sessionId: session.sessionId, qrToken: session.qrToken });
+
+    return res.json({ success: true, session, qrPayload });
   } catch (err) {
     console.error("teacher/createSession error:", err);
     return res.status(500).json({ success: false, error: err.message || "Create session error" });
@@ -350,7 +376,8 @@ app.get("/teacher/getSession/:classId", async (req, res) => {
 
     // rotate QR token and update expiry
     const newToken = uuidv4();
-    const newQrExpiresAt = new Date(Date.now() + 20 * 1000).toISOString();
+    const newQrExpiresAt = new Date(Date.now() + QR_EXPIRE_SECONDS * 1000).toISOString();
+
     await dynamoDB.send(
       new UpdateCommand({
         TableName: SESSIONS_TABLE,
@@ -360,9 +387,10 @@ app.get("/teacher/getSession/:classId", async (req, res) => {
       })
     );
 
-    // return session with updated token/expiry
     const updated = { ...session, qrToken: newToken, qrExpiresAt: newQrExpiresAt };
-    return res.json({ success: true, session: updated });
+    const qrPayload = JSON.stringify({ sessionId: updated.sessionId, qrToken: updated.qrToken });
+
+    return res.json({ success: true, session: updated, qrPayload });
   } catch (err) {
     console.error("teacher/getSession error:", err);
     return res.status(500).json({ success: false, error: err.message || "Get session error" });
@@ -373,8 +401,6 @@ app.get("/teacher/getSession/:classId", async (req, res) => {
 app.get("/teacher/viewAttendance/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   try {
-    // Query attendance by sessionId via GSI 'sessionId-index' OR by partition key if table design supports it
-    // If your Attendance table has partitionKey=sessionId and sortKey=userId you can Query directly:
     const q = {
       TableName: ATT_TABLE,
       IndexName: "sessionId-index",
@@ -386,7 +412,6 @@ app.get("/teacher/viewAttendance/:sessionId", async (req, res) => {
     try {
       attendanceResp = await dynamoDB.send(new QueryCommand(q));
     } catch (err) {
-      // fallback to scan filter if index not present
       console.debug("sessionId-index query failed, falling back to scan:", err.message || err);
       const scanResp = await dynamoDB.send(new ScanCommand({ TableName: ATT_TABLE }));
       attendanceResp = { Items: (scanResp.Items || []).filter((it) => it.sessionId === sessionId) };
@@ -405,7 +430,6 @@ app.post("/teacher/finalizeAttendance", async (req, res) => {
   if (!sessionId) return res.status(400).json({ success: false, error: "sessionId required" });
 
   try {
-    // mark session finalized
     await dynamoDB.send(
       new UpdateCommand({
         TableName: SESSIONS_TABLE,
@@ -427,7 +451,6 @@ app.post("/teacher/finalizeAttendance", async (req, res) => {
         })
       );
     } catch (err) {
-      // fallback to scan
       const scanResp = await dynamoDB.send(new ScanCommand({ TableName: ATT_TABLE }));
       attendanceResp = { Items: (scanResp.Items || []).filter((it) => it.sessionId === sessionId) };
     }
