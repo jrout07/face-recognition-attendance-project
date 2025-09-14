@@ -327,8 +327,8 @@ app.post("/markAttendanceLive", async (req, res) => {
       const newSessionId = uuidv4();
       const qrToken = uuidv4();
       const now = new Date();
-      const validUntil = new Date(now.getTime() + 10 * 60 * 1000).toISOString(); // 10 minutes session
-      const qrExpiresAt = new Date(now.getTime() + 20 * 1000).toISOString(); // QR valid 20 sec
+      const validUntil = new Date(now.getTime() + 10 * 60 * 1000).toISOString(); // 10 minutes
+      const qrExpiresAt = new Date(now.getTime() + 20 * 1000).toISOString(); // 20 sec QR
 
       const session = {
         sessionId: newSessionId,
@@ -356,12 +356,23 @@ app.post("/markAttendanceLive", async (req, res) => {
     }
 
     // Student flow
+    if (userResp.Item.role === "student" && !sessionId) {
+      // ✅ Face-only verification (before QR)
+      return res.json({
+        success: true,
+        message: "Face verified successfully",
+        similarity,
+        suspicious,
+      });
+    }
+
     if (!sessionId) {
       return res
         .status(400)
-        .json({ success: false, error: "sessionId required for student attendance" });
+        .json({ success: false, error: "sessionId required for attendance" });
     }
 
+    // 🟢 Student attendance marking (with QR + face)
     const sessionResp = await dynamoDB.send(
       new GetCommand({
         TableName: process.env.DYNAMODB_SESSIONS_TABLE,
@@ -372,6 +383,7 @@ app.post("/markAttendanceLive", async (req, res) => {
       return res
         .status(404)
         .json({ success: false, error: "Session not found" });
+
     const now = new Date();
     if (new Date(sessionResp.Item.validUntil) < now)
       return res.status(400).json({ success: false, error: "Session expired" });
@@ -418,6 +430,7 @@ app.post("/markAttendanceLive", async (req, res) => {
       .json({ success: false, error: err.message, suspicious: true });
   }
 });
+
 
 /* ------------------ Teacher Session & QR ------------------ */
 app.post("/teacher/createSession", async (req, res) => {
