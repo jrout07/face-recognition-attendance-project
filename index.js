@@ -218,6 +218,42 @@ app.post("/checkLiveness", async (req, res) => {
   }
 });
 
+/* ------------------ Face Verification Only ------------------ */
+app.post("/verifyFaceOnly", async (req, res) => {
+  const { userId, imageBase64 } = req.body;
+  if (!userId || !imageBase64) {
+    return res.status(400).json({ success: false, error: "userId and imageBase64 required" });
+  }
+
+  try {
+    const imageBuffer = Buffer.from(
+      imageBase64.replace(/^data:image\/\w+;base64,/, ""),
+      "base64"
+    );
+
+    const searchResponse = await rekognition.send(
+      new SearchFacesByImageCommand({
+        CollectionId: process.env.REKOGNITION_COLLECTION_ID,
+        Image: { Bytes: imageBuffer },
+        MaxFaces: 1,
+        FaceMatchThreshold: FACE_MATCH_THRESHOLD,
+      })
+    );
+
+    const faceMatch = searchResponse.FaceMatches?.[0];
+    if (!faceMatch) return res.json({ success: false, error: "No matching face found" });
+
+    if (faceMatch.Face?.ExternalImageId !== userId) {
+      return res.json({ success: false, error: "Face does not match user ID" });
+    }
+
+    return res.json({ success: true, message: "Face verified" });
+  } catch (err) {
+    console.error("verifyFaceOnly error:", err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 /* ------------------ Face Verification + Temp Attendance ------------------ */
 app.post("/markAttendanceLive", async (req, res) => {
   const { sessionId, userId, imageBase64 } = req.body;
