@@ -341,7 +341,6 @@ app.post("/teacher/createSession", async (req, res) => {
     return res.status(400).json({ success: false, error: "teacherId & classId required" });
 
   try {
-    // validate teacher exists and is approved teacher
     const teacher = await dynamoDB.send(new GetCommand({ TableName: USERS_TABLE, Key: { userId: teacherId } }));
     if (!teacher.Item) return res.status(403).json({ success: false, error: "Teacher not found" });
     if (teacher.Item.role !== "teacher") return res.status(403).json({ success: false, error: "User not a teacher" });
@@ -357,8 +356,8 @@ app.post("/teacher/createSession", async (req, res) => {
 
     await dynamoDB.send(new PutCommand({ TableName: SESSIONS_TABLE, Item: session }));
 
-    // Build qrPayload string teacher frontend should encode as the QR
-    const qrPayload = JSON.stringify({ sessionId: session.sessionId, qrToken: session.qrToken });
+    // return qrPayload as object, not string
+    const qrPayload = { sessionId: session.sessionId, qrToken: session.qrToken };
 
     return res.json({ success: true, session, qrPayload });
   } catch (err) {
@@ -367,12 +366,12 @@ app.post("/teacher/createSession", async (req, res) => {
   }
 });
 
-/* ------------------ Teacher Get / Refresh Session by classId ------------------ */
-app.get("/teacher/getSession/:classId", async (req, res) => {
-  const { classId } = req.params;
+/* ------------------ Teacher Get / Refresh Session by sessionId ------------------ */
+app.get("/teacher/getSession/:sessionId", async (req, res) => {
+  const { sessionId } = req.params;
   try {
-    const session = await findActiveSessionByClass(classId);
-    if (!session) return res.json({ success: false, error: "No active session" });
+    const session = await getSessionById(sessionId);
+    if (!session || session.finalized) return res.json({ success: false, error: "No active session" });
 
     // rotate QR token and update expiry
     const newToken = uuidv4();
@@ -381,14 +380,14 @@ app.get("/teacher/getSession/:classId", async (req, res) => {
     await dynamoDB.send(
       new UpdateCommand({
         TableName: SESSIONS_TABLE,
-        Key: { sessionId: session.sessionId },
+        Key: { sessionId },
         UpdateExpression: "SET qrToken = :q, qrExpiresAt = :e",
         ExpressionAttributeValues: { ":q": newToken, ":e": newQrExpiresAt },
       })
     );
 
     const updated = { ...session, qrToken: newToken, qrExpiresAt: newQrExpiresAt };
-    const qrPayload = JSON.stringify({ sessionId: updated.sessionId, qrToken: updated.qrToken });
+    const qrPayload = { sessionId: updated.sessionId, qrToken: updated.qrToken };
 
     return res.json({ success: true, session: updated, qrPayload });
   } catch (err) {
@@ -396,6 +395,7 @@ app.get("/teacher/getSession/:classId", async (req, res) => {
     return res.status(500).json({ success: false, error: err.message || "Get session error" });
   }
 });
+
 
 /* ------------------ Teacher View Attendance for session ------------------ */
 app.get("/teacher/viewAttendance/:sessionId", async (req, res) => {
