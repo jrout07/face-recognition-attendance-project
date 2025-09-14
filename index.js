@@ -218,6 +218,60 @@ app.post("/checkLiveness", async (req, res) => {
   }
 });
 
+/* ------------------ Face Verification + Temp Attendance ------------------ */
+app.post("/markAttendanceLive", async (req, res) => {
+  const { sessionId, userId, imageBase64 } = req.body;
+  if (!sessionId || !userId || !imageBase64) {
+    return res.status(400).json({ success: false, error: "sessionId, userId and imageBase64 required" });
+  }
+
+  try {
+    const imageBuffer = Buffer.from(
+      imageBase64.replace(/^data:image\/\w+;base64,/, ""),
+      "base64"
+    );
+
+    const searchResponse = await rekognition.send(
+      new SearchFacesByImageCommand({
+        CollectionId: process.env.REKOGNITION_COLLECTION_ID,
+        Image: { Bytes: imageBuffer },
+        MaxFaces: 1,
+        FaceMatchThreshold: FACE_MATCH_THRESHOLD,
+      })
+    );
+
+    const faceMatch = searchResponse.FaceMatches?.[0];
+    if (!faceMatch) {
+      return res.json({ success: false, error: "No matching face found" });
+    }
+
+    const matchedUserId = faceMatch.Face?.ExternalImageId;
+    if (matchedUserId !== userId) {
+      return res.json({ success: false, error: "Face does not match user ID" });
+    }
+
+    const attendance = {
+      sessionId,
+      userId,
+      status: "present",
+      finalized: false,
+      timestamp: new Date().toISOString(),
+    };
+
+    await dynamoDB.send(
+      new PutCommand({
+        TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
+        Item: attendance,
+      })
+    );
+
+    return res.json({ success: true, message: "Face verified & attendance marked (pending finalization)" });
+  } catch (err) {
+    console.error("markAttendanceLive error:", err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 /* ------------------ Teacher Session & QR ------------------ */
 app.post("/teacher/createSession", async (req, res) => {
   const { teacherId, classId, durationMinutes } = req.body;
@@ -231,7 +285,7 @@ app.post("/teacher/createSession", async (req, res) => {
     const qrToken = uuidv4();
     const qrExpiresAt = new Date(now.getTime() + 20 * 1000).toISOString();
 
-    const session = { sessionId, teacherId, classId, validUntil, qrToken, qrExpiresAt };
+    const session = { sessionId, teacherId, classId, validUntil, qrToken, qrExpiresAt, finalized: false };
 
     await dynamoDB.send(new PutCommand({ TableName: process.env.DYNAMODB_SESSIONS_TABLE, Item: session }));
 
@@ -249,11 +303,11 @@ app.get("/teacher/getSession/:classId", async (req, res) => {
     const sessionResp = await dynamoDB.send(
       new QueryCommand({
         TableName: process.env.DYNAMODB_SESSIONS_TABLE,
-        IndexName: "classId-index", // ✅ make sure you created this GSI
+        IndexName: "classId-index",
         KeyConditionExpression: "classId = :c",
         ExpressionAttributeValues: { ":c": classId },
         Limit: 1,
-        ScanIndexForward: false, // newest first
+        ScanIndexForward: false,
       })
     );
 
@@ -280,10 +334,77 @@ app.get("/teacher/getSession/:classId", async (req, res) => {
         validUntil: session.validUntil,
         qrToken: session.qrToken,
         qrExpiresAt: session.qrExpiresAt,
+        finalized: session.finalized || false,
       },
     });
   } catch (err) {
     console.error("teacher/getSession error:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* ------------------ Teacher View Attendance ------------------ */
+app.get("/teacher/viewAttendance/:sessionId", async (req, res) => {
+  const { sessionId } = req.params;
+  try {
+    const attendanceResp = await dynamoDB.send(
+      new QueryCommand({
+        TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
+        IndexName: "sessionId-index",
+        KeyConditionExpression: "sessionId = :s",
+        ExpressionAttributeValues: { ":s": sessionId },
+      })
+    );
+
+    res.json({ success: true, attendance: attendanceResp.Items || [] });
+  } catch (err) {
+    console.error("viewAttendance error:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* ------------------ Teacher Finalize Attendance ------------------ */
+app.post("/teacher/finalizeAttendance", async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) return res.status(400).json({ success: false, error: "sessionId required" });
+
+  try {
+    // Close the session
+    await dynamoDB.send(
+      new UpdateCommand({
+        TableName: process.env.DYNAMODB_SESSIONS_TABLE,
+        Key: { sessionId },
+        UpdateExpression: "SET finalized = :f",
+        ExpressionAttributeValues: { ":f": true },
+      })
+    );
+
+    // Fetch all attendance records
+    const attendanceResp = await dynamoDB.send(
+      new QueryCommand({
+        TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
+        IndexName: "sessionId-index",
+        KeyConditionExpression: "sessionId = :s",
+        ExpressionAttributeValues: { ":s": sessionId },
+      })
+    );
+
+    const updates = attendanceResp.Items?.map((item) =>
+      dynamoDB.send(
+        new UpdateCommand({
+          TableName: process.env.DYNAMODB_ATTENDANCE_TABLE,
+          Key: { sessionId: item.sessionId, userId: item.userId },
+          UpdateExpression: "SET finalized = :f",
+          ExpressionAttributeValues: { ":f": true },
+        })
+      )
+    );
+
+    if (updates) await Promise.all(updates);
+
+    res.json({ success: true, message: "Attendance finalized", sessionId });
+  } catch (err) {
+    console.error("finalizeAttendance error:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
